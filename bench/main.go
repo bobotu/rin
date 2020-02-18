@@ -79,7 +79,7 @@ func normalIo() {
 
 func ringIo() {
 	ring, err := rin.NewRing(&rin.Config{
-		QueueDepth:          4096,
+		QueueDepth:          256,
 		SubmitQueuePollMode: true,
 	})
 	if err != nil {
@@ -106,11 +106,21 @@ func ringIo() {
 			if err != nil {
 				panic(err)
 			}
+			ts := make([]*rin.Ticket, 12)
+			bufs := make([][]byte, len(ts))
+			for i := range bufs {
+				bufs[i] = alignedBlock()
+			}
 			for {
-				if _, err := ring.Await(ring.ReadAt(f, buf, 0)); err != nil {
-					panic(err)
+				for i := range ts {
+					ts[i] = ring.Nop()
 				}
-				counters[idx].Add(1)
+				for _, t := range ts {
+					if _, err := ring.Await(t); err != nil {
+						panic(err)
+					}
+				}
+				counters[idx].Add(len(ts))
 			}
 		}(i)
 	}

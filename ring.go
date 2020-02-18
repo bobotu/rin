@@ -4,26 +4,18 @@ import (
 	"os"
 	"reflect"
 	"sync"
-	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
 type Ticket struct {
-	wg    sync.WaitGroup
-	res   int32
-	reqId int64
-	id    int
-}
+	wg  sync.WaitGroup
+	res int32
 
-func (t *Ticket) reset(id int, reqId int64) {
-	*t = Ticket{
-		res:   0,
-		id:    id,
-		reqId: reqId,
-	}
-	t.wg.Add(1)
+	ticketId int
+	sqeId    int
+	sqPos    uint32
 }
 
 type Config struct {
@@ -40,14 +32,8 @@ type Ring struct {
 	flags uint32
 
 	iovecs []unix.Iovec
-	sq     struct {
-		sync.Mutex
-		*submitQueue
-	}
-	cq *completionQueue
-
-	requestId   int64
-	submittedId int64
+	sq     *submitQueue
+	cq     *completionQueue
 }
 
 func NewRing(conf *Config) (*Ring, error) {
@@ -77,9 +63,6 @@ func NewRing(conf *Config) (*Ring, error) {
 
 		fd:    fd,
 		flags: p.flags,
-
-		requestId:   0,
-		submittedId: -1,
 	}
 	iovecs, err := alloc(int(capacity) * int(unsafe.Sizeof(unix.Iovec{})))
 	if err != nil {
@@ -91,7 +74,7 @@ func NewRing(conf *Config) (*Ring, error) {
 	hdr.Len = int(capacity)
 	hdr.Data = uintptr(unsafe.Pointer(&iovecs[0]))
 
-	r.sq.submitQueue, err = newSubmitQueue(fd, p)
+	r.sq, err = newSubmitQueue(fd, p)
 	if err != nil {
 		r.Close()
 		return nil, err
@@ -108,14 +91,12 @@ func NewRing(conf *Config) (*Ring, error) {
 }
 
 func (r *Ring) Close() {
-	if r.sq.submitQueue != nil && r.cq != nil {
+	if r.sq != nil && r.cq != nil {
 		r.stopReaper()
 	}
 
-	if r.sq.submitQueue != nil {
-		r.sq.Lock()
+	if r.sq != nil {
 		r.sq.Destroy()
-		r.sq.Unlock()
 	}
 	if r.cq != nil {
 		r.cq.Destroy()
@@ -145,10 +126,10 @@ func (r *Ring) stopReaper() {
 }
 
 func (r *Ring) Await(t *Ticket) (int32, error) {
-	r.ensureSubmitted(t.reqId)
+	r.sq.EnsureSqeSubmitted(t.sqPos, r.fd, r.flags)
 	t.wg.Wait()
 	res := t.res
-	r.ticketCh <- t.id
+	r.ticketCh <- t.ticketId
 
 	if res < 0 {
 		return 0, unix.Errno(-res)
@@ -182,12 +163,6 @@ func (r *Ring) WriteAt(f *os.File, buf []byte, offset int) *Ticket {
 	})
 }
 
-func (r *Ring) SubmitAll() {
-	r.sq.Lock()
-	defer r.sq.Unlock()
-	r.sq.SubmitAll(r.fd, r.flags)
-}
-
 func (r *Ring) setIovec(e *sqe, buf []byte, id int) {
 	vec := &r.iovecs[id]
 	vec.Base = &buf[0]
@@ -200,20 +175,21 @@ func (r *Ring) withSqe(buf []byte, iovec bool, f func(e *sqe)) *Ticket {
 	tidx := <-r.ticketCh
 	t := &r.tickets[tidx]
 
-	r.sq.Lock()
-	defer r.sq.Unlock()
-
-	t.reset(tidx, r.requestId)
-	r.requestId++
-
 	var e *sqe
+	var sqeId int
 	for {
-		e = r.sq.TryPopSqe(r.flags)
+		e, sqeId = r.sq.TryGetSqe(r.flags)
 		if e != nil {
 			break
 		}
-		r.submittedId += int64(r.sq.SubmitAll(r.fd, r.flags))
+		r.sq.SubmitAll(r.fd, r.flags)
 	}
+
+	*t = Ticket{
+		ticketId: tidx,
+		sqeId:    sqeId,
+	}
+	t.wg.Add(1)
 
 	e.userData = uint64(tidx)
 	if len(buf) != 0 {
@@ -225,26 +201,6 @@ func (r *Ring) withSqe(buf []byte, iovec bool, f func(e *sqe)) *Ticket {
 		}
 	}
 	f(e)
-
+	t.sqPos = r.sq.Enqueue(sqeId)
 	return t
-}
-
-func (r *Ring) ensureSubmitted(reqId int64) {
-	current := atomic.LoadInt64(&r.submittedId)
-	if current >= reqId {
-		return
-	}
-
-	r.sq.Lock()
-	defer r.sq.Unlock()
-	current = atomic.LoadInt64(&r.submittedId)
-	if current >= reqId {
-		return
-	}
-
-	submitted := int64(r.sq.SubmitAll(r.fd, r.flags))
-	current = atomic.AddInt64(&r.submittedId, submitted)
-	if r.flags&setupSqPoll == 0 && current < reqId {
-		panic("there are some bug in submit queue")
-	}
 }
