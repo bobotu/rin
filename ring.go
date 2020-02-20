@@ -66,9 +66,12 @@ func NewRing(conf *Config) (r *Ring, err error) {
 
 	r.flags = p.flags
 	r.inflightQuota = int(p.cqEntries)
-	r.ctxReg.Init(conf.MaxContexts)
-	r.reqCh.Init()
+	if err := r.ctxReg.Init(r.fd, conf.MaxContexts); err != nil {
+		r.Close()
+		return nil, err
+	}
 
+	r.reqCh.Init()
 	r.sq, err = newSubmitQueue(r.fd, p)
 	if err != nil {
 		r.Close()
@@ -166,6 +169,30 @@ func (r *Ring) Nop(ctx *Context) {
 	})
 }
 
+func (r *Ring) ReadAt(ctx *Context, fd int32, len, off int) {
+	r.produceRequest(ctx, channelItem{
+		op:       opReadFixed,
+		userData: uint64(ctx.id),
+		fd:       fd,
+		addr:     ctx.getBufferAddr(),
+		off:      uint64(off),
+		len:      uint32(len),
+		bufIdx:   uint16(ctx.bufIdx),
+	})
+}
+
+func (r *Ring) WriteAt(ctx *Context, fd int32, len, off int) {
+	r.produceRequest(ctx, channelItem{
+		op:       opWriteFixed,
+		userData: uint64(ctx.id),
+		fd:       fd,
+		addr:     ctx.getBufferAddr(),
+		off:      uint64(off),
+		len:      uint32(len),
+		bufIdx:   uint16(ctx.bufIdx),
+	})
+}
+
 func (r *Ring) resetNoSubmissionCnt() {
 	r.cntNoSubmition = 0
 	if r.needWakeup == 1 {
@@ -182,7 +209,6 @@ func (r *Ring) resetNoCompletionCnt() {
 
 func (r *Ring) produceRequest(ctx *Context, req channelItem) {
 	if ctx != nil {
-		ctx.wg = sync.WaitGroup{}
 		ctx.wg.Add(1)
 	}
 
@@ -214,7 +240,10 @@ func (r *Ring) reapRequests() {
 			e.opcode = i.op
 			e.flags = 0
 			e.fd = i.fd
-			// TODO: setup buffer here
+			e.addr = i.addr
+			e.setBufIndex(i.bufIdx)
+			e.offOrAddr2 = i.off
+			e.len = i.len
 		}
 	})
 	if cnt == 0 {

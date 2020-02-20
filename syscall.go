@@ -1,6 +1,7 @@
 package rin
 
 import (
+	"log"
 	"math/bits"
 	"unsafe"
 
@@ -67,6 +68,10 @@ func (e *sqe) setReqFlagsU16(f uint16) {
 
 func (e *sqe) setReqFlagsU32(f uint32) {
 	e.reqFlags = f
+}
+
+func (e *sqe) setBufIndex(idx uint16) {
+	*(*uint16)(unsafe.Pointer(&e.bufIndex[0])) = idx
 }
 
 // sqe->flags
@@ -204,6 +209,34 @@ func free(b []byte) error {
 	return unmap(b)
 }
 
+const pageSize = 4096
+
+func alignment(block []byte) int {
+	return int(uintptr(unsafe.Pointer(&block[0])) & uintptr(pageSize-1))
+}
+
+func allocPages(n int) ([]byte, []byte, error) {
+	size := n * pageSize
+	block, err := alloc(size + pageSize)
+	if err != nil {
+		return nil, nil, err
+	}
+	a := alignment(block)
+	offset := 0
+	if a != 0 {
+		offset = pageSize - a
+	}
+	aligned := block[offset : offset+size]
+	// Can't check alignment of a zero sized block
+	if size != 0 {
+		a = alignment(aligned)
+		if a != 0 {
+			log.Fatal("Failed to align block")
+		}
+	}
+	return aligned, block, nil
+}
+
 func mmap(fd int32, offset int64, size int) ([]byte, error) {
 	m, err := unix.Mmap(int(fd), offset, size, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED|unix.MAP_POPULATE)
 	if err != nil {
@@ -225,7 +258,7 @@ func setup(entries uint32, p *params) (int32, error) {
 	}
 
 	ret, _, err := unix.Syscall(trapSetup, uintptr(entries), uintptr(unsafe.Pointer(p)), uintptr(0))
-	if ret < 0 {
+	if int(ret) < 0 {
 		return 0, err
 	}
 	return int32(ret), nil
@@ -234,7 +267,7 @@ func setup(entries uint32, p *params) (int32, error) {
 func enter(fd int32, toSubmit, minComplete, flags uint32) (uint32, error) {
 	for {
 		ret, _, err := unix.Syscall6(trapEnter, uintptr(fd), uintptr(toSubmit), uintptr(minComplete), uintptr(flags), uintptr(0), uintptr(unsafe.Sizeof(unix.Sigset_t{})))
-		if ret < 0 {
+		if int(ret) < 0 {
 			if err == unix.EINTR {
 				continue
 			}
@@ -242,4 +275,12 @@ func enter(fd int32, toSubmit, minComplete, flags uint32) (uint32, error) {
 		}
 		return uint32(ret), nil
 	}
+}
+
+func register(fd int32, opcode int, arg unsafe.Pointer, argLen int) error {
+	ret, _, err := unix.Syscall6(trapRegister, uintptr(fd), uintptr(opcode), uintptr(arg), uintptr(argLen), 0, 0)
+	if int(ret) < 0 {
+		return err
+	}
+	return nil
 }

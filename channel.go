@@ -28,10 +28,12 @@ func (c *channel) Reap(reaper func(items []channelItem)) {
 
 type channelItem struct {
 	op       uint8
+	bufIdx   uint16
 	fd       int32
 	userData uint64
-
-	// TODO: buffer management
+	addr     uint64
+	off      uint64
+	len      uint32
 }
 
 type channelSlot struct {
