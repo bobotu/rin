@@ -3,7 +3,6 @@ package rin
 import (
 	"fmt"
 	"reflect"
-	"runtime"
 	"sync/atomic"
 	"unsafe"
 )
@@ -18,6 +17,9 @@ type submitQueue struct {
 	kdropped     *uint32
 	karray       []uint32
 	ksqes        []sqe
+
+	fd         int32
+	setupFlags uint32
 
 	head uint32
 	tail uint32
@@ -48,6 +50,8 @@ func newSubmitQueue(fd int32, p *params) (*submitQueue, error) {
 		kringEntries: (*uint32)(unsafe.Pointer(uintptr(ringPtr) + uintptr(p.sqOff.ringEntries))),
 		kflags:       (*uint32)(unsafe.Pointer(uintptr(ringPtr) + uintptr(p.sqOff.flags))),
 		kdropped:     (*uint32)(unsafe.Pointer(uintptr(ringPtr) + uintptr(p.sqOff.dropped))),
+		fd:           fd,
+		setupFlags:   p.flags,
 		ringMmap:     ringData,
 		sqesMmap:     sqesData,
 	}
@@ -64,10 +68,10 @@ func newSubmitQueue(fd int32, p *params) (*submitQueue, error) {
 	return sq, nil
 }
 
-func (sq *submitQueue) TryPopSqe(flags uint32) *sqe {
+func (sq *submitQueue) TryPopSqe() *sqe {
 	next := sq.tail + 1
 	head := sq.head
-	if flags&setupSqPoll != 0 {
+	if sq.setupFlags&setupSqPoll != 0 {
 		head = atomic.LoadUint32(sq.khead)
 	}
 
@@ -80,9 +84,38 @@ func (sq *submitQueue) TryPopSqe(flags uint32) *sqe {
 	return &sq.ksqes[idx]
 }
 
-func (sq *submitQueue) Flush() uint32 {
+func (sq *submitQueue) Flush(toSubmit, minWait uint32) uint32 {
+	flags := enterGetEvents
+	if sq.setupFlags&setupSqPoll == 0 {
+		submitted, err := enter(sq.fd, toSubmit, minWait, flags)
+		if err != nil {
+			panic(fmt.Sprintf("submit request entries failed, this should never occur. err: %s", err))
+		}
+		if atomic.LoadUint32(sq.kdropped) != 0 {
+			panic("submission queue has dropped some request")
+		}
+		return submitted
+	}
+
+	flags |= enterSqWakeup
+	if atomic.LoadUint32(sq.kflags)&sqNeedWakeup != 0 {
+		// the kernel has signalled to us that the
+		// SQPOLL thread that checks the submission
+		// queue has terminated due to inactivity,
+		// and needs to be restarted.
+		if _, err := enter(sq.fd, toSubmit, minWait, flags); err != nil {
+			panic(fmt.Sprintf("wakeup kernel poll thread failed, this should never occur. err: %s", err))
+		}
+	}
+	return toSubmit
+}
+
+func (sq *submitQueue) PendingCount() uint32 {
+	return sq.tail - sq.head
+}
+
+func (sq *submitQueue) Submit(toSubmit uint32) {
 	mask := *sq.kringMask
-	toSubmit := sq.tail - sq.head
 	ktail := atomic.LoadUint32(sq.ktail)
 
 	for i := uint32(0); i < toSubmit; i++ {
@@ -92,34 +125,6 @@ func (sq *submitQueue) Flush() uint32 {
 		sq.head++
 	}
 	atomic.StoreUint32(sq.ktail, ktail)
-	return toSubmit
-}
-
-func (sq *submitQueue) SubmitAll(fd int32, flags uint32) int {
-	cnt := sq.Flush()
-
-	if flags&setupSqPoll == 0 {
-		remain := cnt
-		for remain > 0 {
-			sbmt, err := enter(fd, remain, 0, flags)
-			if err != nil {
-				panic(fmt.Sprintf("submit request entries failed, this should never occur. err: %s", err))
-			}
-			remain -= uint32(sbmt)
-		}
-		return int(cnt)
-	}
-
-	if atomic.LoadUint32(sq.kflags)&sqNeedWakeup != 0 {
-		// the kernel has signalled to us that the
-		// SQPOLL thread that checks the submission
-		// queue has terminated due to inactivity,
-		// and needs to be restarted.
-		if _, err := enter(fd, cnt, 0, enterSqWakeup); err != nil {
-			panic(fmt.Sprintf("wakeup kernel poll thread failed, this should never occur. err: %s", err))
-		}
-	}
-	return 0
 }
 
 func (sq *submitQueue) Destroy() {
@@ -135,13 +140,10 @@ type completionQueue struct {
 	koverflow *uint32
 	kcqes     []cqe
 
-	fd      int32
-	tickets []Ticket
-
 	ringMmap []byte
 }
 
-func newCompletionQueue(fd int32, p *params, tickets []Ticket) (*completionQueue, error) {
+func newCompletionQueue(fd int32, p *params) (*completionQueue, error) {
 	sz := p.cqOff.cqes + p.cqEntries*uint32(unsafe.Sizeof(cqe{}))
 	ringData, err := mmap(fd, offCqRing, int(sz))
 	if err != nil {
@@ -155,8 +157,6 @@ func newCompletionQueue(fd int32, p *params, tickets []Ticket) (*completionQueue
 		kringMask: (*uint32)(unsafe.Pointer(uintptr(ringPtr) + uintptr(p.cqOff.ringMask))),
 		koverflow: (*uint32)(unsafe.Pointer(uintptr(ringPtr) + uintptr(p.cqOff.overflow))),
 
-		fd:       fd,
-		tickets:  tickets,
 		ringMmap: ringData,
 	}
 	cqesHdr := (*reflect.SliceHeader)(unsafe.Pointer(&cq.kcqes))
@@ -171,40 +171,31 @@ func (cq *completionQueue) Destroy() {
 	unmap(cq.ringMmap)
 }
 
-func (cq *completionQueue) Reaper() {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	for {
-		if _, err := enter(cq.fd, 0, 1, enterGetEvents); err != nil {
-			panic(fmt.Sprintf("error in cqe reaper: %s", err))
-		}
-		stop := cq.reaper()
-		if stop {
-			return
-		}
+type cqIterator struct {
+	cq   *completionQueue
+	head uint32
+	tail uint32
+	mask uint32
+}
+
+func (cq *completionQueue) NewIterator() *cqIterator {
+	return &cqIterator{
+		cq:   cq,
+		head: atomic.LoadUint32(cq.khead),
+		tail: atomic.LoadUint32(cq.ktail),
+		mask: *cq.kringMask,
 	}
 }
 
-func (cq *completionQueue) reaper() bool {
-	head := atomic.LoadUint32(cq.khead)
-	tail := atomic.LoadUint32(cq.ktail)
-	var stop bool
+func (it *cqIterator) Valid() bool {
+	return it.head != it.tail
+}
 
-	for head != tail {
-		idx := head & *cq.kringMask
-		e := &cq.kcqes[idx]
+func (it *cqIterator) Next() {
+	it.head++
+	atomic.AddUint32(it.cq.khead, 1)
+}
 
-		if e.userData&poisonPillMask != 0 {
-			e.userData &= (poisonPillMask - 1)
-			stop = true
-		}
-
-		ticket := &cq.tickets[e.userData]
-		ticket.res = e.res
-		ticket.wg.Done()
-
-		atomic.AddUint32(cq.khead, 1)
-		head++
-	}
-	return stop
+func (it *cqIterator) Value() *cqe {
+	return &it.cq.kcqes[it.head&it.mask]
 }

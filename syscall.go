@@ -61,6 +61,14 @@ type sqe struct {
 	bufIndex [3]uint64
 }
 
+func (e *sqe) setReqFlagsU16(f uint16) {
+	*(*uint16)(unsafe.Pointer(&e.reqFlags)) = f
+}
+
+func (e *sqe) setReqFlagsU32(f uint32) {
+	e.reqFlags = f
+}
+
 // sqe->flags
 const (
 	sqeFixedFile = 1 << iota
@@ -154,7 +162,7 @@ type cqRingOffsets struct {
 
 // io_uring_enter(2) flags
 const (
-	enterGetEvents = 1 << iota
+	enterGetEvents uint32 = 1 << iota
 	enterSqWakeup
 )
 
@@ -223,7 +231,7 @@ func setup(entries uint32, p *params) (int32, error) {
 	return int32(ret), nil
 }
 
-func enter(fd int32, toSubmit, minComplete, flags uint32) (int, error) {
+func enter(fd int32, toSubmit, minComplete, flags uint32) (uint32, error) {
 	for {
 		ret, _, err := unix.Syscall6(trapEnter, uintptr(fd), uintptr(toSubmit), uintptr(minComplete), uintptr(flags), uintptr(0), uintptr(unsafe.Sizeof(unix.Sigset_t{})))
 		if ret < 0 {
@@ -232,6 +240,6 @@ func enter(fd int32, toSubmit, minComplete, flags uint32) (int, error) {
 			}
 			return 0, err
 		}
-		return int(ret), nil
+		return uint32(ret), nil
 	}
 }
