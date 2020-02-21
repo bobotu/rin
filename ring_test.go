@@ -10,19 +10,29 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
-func TestAwaitAndStop(t *testing.T) {
+func newRing(depth, contexts int) *Ring {
 	ring, err := NewRing(&Config{
-		QueueDepth:          32,
+		QueueDepth:          uint32(depth),
 		SubmitQueuePollMode: false,
-		MaxContexts:         8,
+		BufferSize:          4096,
+		UseFixedBuffer:      contexts < 1024,
+		MaxContexts:         contexts,
 		MaxLoopNoReq:        2,
 		MaxLoopNoResp:       2,
 	})
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
+	return ring
+}
+
+func TestAwaitAndStop(t *testing.T) {
+	ring := newRing(32, 4)
 	defer ring.Close()
 
 	ctx := ring.NewContext()
@@ -43,16 +53,7 @@ func TestReadWritePage(t *testing.T) {
 	content := make([]byte, 4096)
 	rand.Read(content)
 
-	ring, err := NewRing(&Config{
-		QueueDepth:          32,
-		SubmitQueuePollMode: false,
-		MaxContexts:         8,
-		MaxLoopNoReq:        2,
-		MaxLoopNoResp:       2,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	ring := newRing(32, 4)
 	defer ring.Close()
 
 	ctx := ring.NewContext()
@@ -70,16 +71,7 @@ func TestSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ring, err := NewRing(&Config{
-		QueueDepth:          32,
-		SubmitQueuePollMode: false,
-		MaxContexts:         4,
-		MaxLoopNoReq:        2,
-		MaxLoopNoResp:       2,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	ring := newRing(2048, 2048)
 	defer ring.Close()
 
 	go func() {
@@ -92,7 +84,8 @@ func TestSocket(t *testing.T) {
 			go func() {
 				fd, err := conn.File()
 				if err != nil {
-					t.Fatal(err)
+					log.Fatal(err)
+					return
 				}
 				conn.Close()
 				defer fd.Close()
@@ -100,97 +93,92 @@ func TestSocket(t *testing.T) {
 				ctx := ring.NewContext()
 				defer ring.Finish(ctx)
 
-				ring.ReadAt(ctx, int32(fd.Fd()), 4096, 0)
-				sz, err := ring.Await(ctx)
-				if err != nil {
-					t.Fatal(err)
-				}
-				log.Printf("read value from client conn %v\n", ctx.GetBuffer(int(sz)))
+				for {
+					buf := ctx.GetBuffer()
+					ring.Read(ctx, int32(fd.Fd()), buf)
+					sz, err := ring.Await(ctx)
+					if err != nil {
+						log.Fatal(err)
+						return
+					}
+					if sz == 0 {
+						return
+					}
 
-				buf := ctx.GetBuffer(int(sz))
-				for i := range buf {
-					buf[i]++
-				}
+					buf = buf[:sz]
+					for i := range buf {
+						buf[i]++
+					}
 
-				ring.WriteAt(ctx, int32(fd.Fd()), int(sz), 0)
-				written, err := ring.Await(ctx)
-				if err != nil {
-					t.Fatal(err)
+					ring.Write(ctx, int32(fd.Fd()), buf)
+					_, err = ring.Await(ctx)
+					if err != nil {
+						log.Fatal(err)
+						return
+					}
 				}
-				log.Printf("written %d to client\n", written)
 			}()
 		}
 	}()
 
-	conn, err := net.DialTCP("tcp", nil, &net.TCPAddr{
-		IP:   net.IPv4(127, 0, 0, 1),
-		Port: 60336,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	fd, err := conn.File()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := ring.NewContext()
-	defer ring.Finish(ctx)
-
-	buf := ctx.GetBuffer(256)
-	rand.Read(buf)
-
-	ring.WriteAt(ctx, int32(fd.Fd()), len(buf), 0)
-	written, err := ring.Await(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	log.Printf("written %d to server\n", written)
-
-	ring.ReadAt(ctx, int32(fd.Fd()), len(buf), 0)
-	sz, err := ring.Await(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sz == 0 {
-		t.Fatal("read EOF")
-	}
-	log.Printf("read value from server %v\n", ctx.GetBuffer(int(sz)))
-	fd.Close()
-	l.Close()
-}
-
-func TestConcurrentReadWrite(t *testing.T) {
-	t.Skip("not for now")
 	var wg sync.WaitGroup
-	start := make(chan struct{})
-
-	ring, err := NewRing(&Config{
-		QueueDepth:          32,
-		SubmitQueuePollMode: false,
-		MaxContexts:         8,
-		MaxLoopNoReq:        2,
-		MaxLoopNoResp:       2,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ring.Close()
-
-	for i := 0; i < runtime.GOMAXPROCS(0); i++ {
+	for i := 0; i < 1024; i++ {
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
+			conn, err := net.DialTCP("tcp", nil, &net.TCPAddr{
+				IP:   net.IPv4(127, 0, 0, 1),
+				Port: 60336,
+			})
+			if err != nil {
+				log.Fatal(err)
+				return
+			}
+			fd, err := conn.File()
+			if err != nil {
+				log.Fatal(err)
+				return
+			}
+			defer fd.Close()
+
 			ctx := ring.NewContext()
 			defer ring.Finish(ctx)
-			content := make([]byte, 128*4096)
-			rand.Read(content)
-			<-start
-			writeAndReadFile(t, ctx, ring, content)
-		}()
+			rnd := rand.New(rand.NewSource(rand.Int63()))
+			for j := 0; j < 10; j++ {
+				sz := rnd.Intn(4096) + 1
+				buf := ctx.GetBuffer()[:sz]
+				rnd.Read(buf)
+
+				ring.Write(ctx, int32(fd.Fd()), buf)
+				_, err := ring.Await(ctx)
+				if err != nil {
+					log.Fatal(err)
+					return
+				}
+				request := append([]byte{}, buf...)
+
+				ring.Read(ctx, int32(fd.Fd()), buf)
+				res, err := ring.Await(ctx)
+				if err != nil {
+					log.Fatal(err)
+					return
+				}
+				if sz != int(res) {
+					log.Fatal("short read")
+					return
+				}
+				for i := range buf {
+					if buf[i]-request[i] != 1 {
+						log.Fatal("incorrect result")
+					}
+				}
+
+				time.Sleep(5 * time.Second)
+			}
+		}(i)
 	}
-	close(start)
 	wg.Wait()
+	l.Close()
 }
 
 func writeAndReadFile(t *testing.T, ctx *Context, ring *Ring, content []byte) {
@@ -199,11 +187,14 @@ func writeAndReadFile(t *testing.T, ctx *Context, ring *Ring, content []byte) {
 		t.Fatal(err)
 	}
 	defer os.Remove(f.Name())
-	fd := int32(f.Fd())
-	buf := ctx.GetBuffer(len(content))
+	fd, err := unix.Open(f.Name(), unix.O_RDWR, 0666)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := ctx.GetBuffer()[:len(content)]
 	copy(buf, content)
 
-	ring.WriteAt(ctx, fd, len(content), 0)
+	ring.WriteAt(ctx, int32(fd), buf, 0)
 	nn, err := ring.Await(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -213,14 +204,14 @@ func writeAndReadFile(t *testing.T, ctx *Context, ring *Ring, content []byte) {
 	}
 
 	copy(buf, make([]byte, len(content)))
-	ring.ReadAt(ctx, fd, len(content), 0)
+	ring.ReadAt(ctx, int32(fd), buf, 0)
 	_, err = ring.Await(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if !bytes.Equal(ctx.GetBuffer(len(content)), content) {
+	if !bytes.Equal(buf, content) {
 		t.Fatalf("content is incorrect")
 	}
-
+	runtime.KeepAlive(f)
 }

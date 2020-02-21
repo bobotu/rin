@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
+	"github.com/pingcap/errors"
 	"golang.org/x/sys/unix"
 )
 
@@ -14,6 +15,8 @@ type Config struct {
 	QueueDepth              uint32
 	SubmitQueuePollAffinity uint32
 	SubmitQueuePollMode     bool
+	UseFixedBuffer          bool
+	BufferSize              int
 
 	MaxContexts   int
 	MaxLoopNoReq  int
@@ -25,8 +28,8 @@ type Ring struct {
 	flags uint32
 	conf  *Config
 
-	ctxReg contextRegister
-	reqCh  channel
+	contexts   contexts
+	reqestChan requestChan
 
 	sq *submitQueue
 	cq *completionQueue
@@ -53,35 +56,36 @@ func NewRing(conf *Config) (r *Ring, err error) {
 	r = &Ring{conf: conf}
 
 	if err := r.setupEventFd(); err != nil {
-		return nil, err
+		return nil, errors.Trace(err)
 	}
 
 	r.fd, err = setup(conf.QueueDepth, p)
 	if err != nil {
-		return nil, err
+		return nil, errors.Trace(err)
 	}
 	if r.fd < 0 {
 		panic("invalid ring fd")
 	}
-
 	r.flags = p.flags
 	r.inflightQuota = int(p.cqEntries)
-	if err := r.ctxReg.Init(r.fd, conf.MaxContexts); err != nil {
+
+	err = r.contexts.Init(r.fd, conf)
+	if err != nil {
 		r.Close()
-		return nil, err
+		return nil, errors.Trace(err)
 	}
 
-	r.reqCh.Init()
+	r.reqestChan.Init()
 	r.sq, err = newSubmitQueue(r.fd, p)
 	if err != nil {
 		r.Close()
-		return nil, err
+		return nil, errors.Trace(err)
 	}
 
 	r.cq, err = newCompletionQueue(r.fd, p)
 	if err != nil {
 		r.Close()
-		return nil, err
+		return nil, errors.Trace(err)
 	}
 
 	go r.loop()
@@ -92,13 +96,13 @@ func NewRing(conf *Config) (r *Ring, err error) {
 func (r *Ring) setupEventFd() error {
 	fd, err := unix.Eventfd(0, unix.EFD_SEMAPHORE)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 	bufSize := int(unsafe.Sizeof(unix.Iovec{})) + 8
 	mem, err := alloc(bufSize)
 	if err != nil {
 		unix.Close(fd)
-		return err
+		return errors.Trace(err)
 	}
 	r.eventFd = int32(fd)
 	r.eventFdBuf = (*unix.Iovec)(unsafe.Pointer(&mem[8]))
@@ -119,7 +123,7 @@ func (r *Ring) setupWakeup() {
 func (r *Ring) Close() {
 	if r.sq != nil && r.cq != nil {
 		r.stopWg.Add(1)
-		r.produceRequest(nil, channelItem{
+		r.produceRequest(nil, &request{
 			op:       opNop,
 			userData: maskPoisonPill,
 		})
@@ -145,17 +149,16 @@ func (r *Ring) Close() {
 }
 
 func (r *Ring) NewContext() *Context {
-	return r.ctxReg.Acquire()
+	return r.contexts.Acquire()
 }
 
 func (r *Ring) Finish(ctx *Context) {
-	r.ctxReg.Release(ctx)
+	r.contexts.Release(ctx)
 }
 
 func (r *Ring) Await(ctx *Context) (int32, error) {
 	ctx.wg.Wait()
 	res := ctx.res
-
 	if res < 0 {
 		return 0, unix.Errno(-res)
 	}
@@ -163,56 +166,74 @@ func (r *Ring) Await(ctx *Context) (int32, error) {
 }
 
 func (r *Ring) Nop(ctx *Context) {
-	r.produceRequest(ctx, channelItem{
+	r.produceRequest(ctx, &request{
 		op:       opNop,
 		userData: uint64(ctx.id),
 	})
 }
 
-func (r *Ring) ReadAt(ctx *Context, fd int32, len, off int) {
-	r.produceRequest(ctx, channelItem{
-		op:       opReadFixed,
-		userData: uint64(ctx.id),
-		fd:       fd,
-		addr:     ctx.getBufferAddr(),
-		off:      uint64(off),
-		len:      uint32(len),
-		bufIdx:   uint16(ctx.bufIdx),
-	})
+func (r *Ring) Read(ctx *Context, fd int32, buf []byte) {
+	// TODO: A patch has allowed offset be -1 to use offset mantianed by fd,
+	// investigate which version of kernel include this patch.
+	r.ReadAt(ctx, fd, buf, 0)
 }
 
-func (r *Ring) WriteAt(ctx *Context, fd int32, len, off int) {
-	r.produceRequest(ctx, channelItem{
-		op:       opWriteFixed,
+func (r *Ring) ReadAt(ctx *Context, fd int32, buf []byte, off int) {
+	op := opReadv
+	if r.conf.UseFixedBuffer {
+		op = opReadFixed
+	}
+	req := &request{
+		op:       op,
 		userData: uint64(ctx.id),
 		fd:       fd,
-		addr:     ctx.getBufferAddr(),
 		off:      uint64(off),
-		len:      uint32(len),
-		bufIdx:   uint16(ctx.bufIdx),
-	})
+	}
+	ctx.setBufferAddrForReq(req, buf)
+	r.produceRequest(ctx, req)
+}
+
+func (r *Ring) Write(ctx *Context, fd int32, buf []byte) {
+	// TODO: A patch has allowed offset be -1 to use offset mantianed by fd,
+	// investigate which version of kernel include this patch.
+	r.WriteAt(ctx, fd, buf, 0)
+}
+
+func (r *Ring) WriteAt(ctx *Context, fd int32, buf []byte, off int) {
+	op := opWritev
+	if r.conf.UseFixedBuffer {
+		op = opWriteFixed
+	}
+	req := &request{
+		op:       op,
+		userData: uint64(ctx.id),
+		fd:       fd,
+		off:      uint64(off),
+	}
+	ctx.setBufferAddrForReq(req, buf)
+	r.produceRequest(ctx, req)
 }
 
 func (r *Ring) resetNoSubmissionCnt() {
 	r.cntNoSubmition = 0
-	if r.needWakeup == 1 {
+	if atomic.LoadInt32(&r.needWakeup) == 1 {
 		atomic.StoreInt32(&r.needWakeup, 0)
 	}
 }
 
 func (r *Ring) resetNoCompletionCnt() {
 	r.cntNoCompletion = 0
-	if r.needWakeup == 1 {
+	if atomic.LoadInt32(&r.needWakeup) == 1 {
 		atomic.StoreInt32(&r.needWakeup, 0)
 	}
 }
 
-func (r *Ring) produceRequest(ctx *Context, req channelItem) {
+func (r *Ring) produceRequest(ctx *Context, req *request) {
 	if ctx != nil {
 		ctx.wg.Add(1)
 	}
 
-	r.reqCh.Send(req)
+	r.reqestChan.Send(req)
 
 	// CAS operation contains a cache line write (invalidation) with needed memory fence.
 	// To avoid a cache line contention in normal case, use a atomic load before doing CAS.
@@ -228,7 +249,7 @@ func (r *Ring) produceRequest(ctx *Context, req channelItem) {
 
 func (r *Ring) reapRequests() {
 	var cnt int
-	r.reqCh.Reap(func(items []channelItem) {
+	r.reqestChan.Reap(func(items []request) {
 		for _, i := range items {
 			// The call of getNextSqe may trap in kernel for a while,
 			// this is safe because we don't hold any lock of channel,
@@ -278,7 +299,7 @@ func (r *Ring) reapCompletions() {
 			continue
 		}
 
-		ctx := r.ctxReg.Get(uint32(e.userData))
+		ctx := r.contexts.Get(uint32(e.userData))
 		ctx.res = e.res
 		ctx.wg.Done()
 	}
@@ -322,7 +343,7 @@ func (r *Ring) submit(waitIfNoQuota, waitIfNeedWakeup bool) int {
 	}
 
 	var minWait uint32
-	if (waitIfNeedWakeup && r.needWakeup == 1) || (waitIfNoQuota && toSubmit == 0) {
+	if (waitIfNeedWakeup && atomic.LoadInt32(&r.needWakeup) == 1) || (waitIfNoQuota && toSubmit == 0) {
 		minWait = 1
 	}
 

@@ -5,6 +5,8 @@ import (
 	"reflect"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/pingcap/errors"
 )
 
 type submitQueue struct {
@@ -32,7 +34,7 @@ func newSubmitQueue(fd int32, p *params) (*submitQueue, error) {
 	sz := p.sqOff.array + (p.sqEntries * 4)
 	ringData, err := mmap(fd, offSqRing, int(sz))
 	if err != nil {
-		return nil, err
+		return nil, errors.Trace(err)
 	}
 	ringPtr := unsafe.Pointer(&ringData[0])
 
@@ -40,7 +42,7 @@ func newSubmitQueue(fd int32, p *params) (*submitQueue, error) {
 	sqesData, err := mmap(fd, offSqes, sqesSz)
 	if err != nil {
 		unmap(ringData)
-		return nil, err
+		return nil, errors.Trace(err)
 	}
 
 	sq := &submitQueue{
@@ -87,6 +89,9 @@ func (sq *submitQueue) TryPopSqe() *sqe {
 func (sq *submitQueue) Flush(toSubmit, minWait uint32) uint32 {
 	flags := enterGetEvents
 	if sq.setupFlags&setupSqPoll == 0 {
+		// if toSubmit == 0 && minWait == 0 {
+		// 	return toSubmit
+		// }
 		submitted, err := enter(sq.fd, toSubmit, minWait, flags)
 		if err != nil {
 			panic(fmt.Sprintf("submit request entries failed, this should never occur. err: %s", err))
@@ -147,7 +152,7 @@ func newCompletionQueue(fd int32, p *params) (*completionQueue, error) {
 	sz := p.cqOff.cqes + p.cqEntries*uint32(unsafe.Sizeof(cqe{}))
 	ringData, err := mmap(fd, offCqRing, int(sz))
 	if err != nil {
-		return nil, err
+		return nil, errors.Trace(err)
 	}
 	ringPtr := unsafe.Pointer(&ringData[0])
 

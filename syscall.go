@@ -215,8 +215,8 @@ func alignment(block []byte) int {
 	return int(uintptr(unsafe.Pointer(&block[0])) & uintptr(pageSize-1))
 }
 
-func allocPages(n int) ([]byte, []byte, error) {
-	size := n * pageSize
+func allocPages(n, blockSize int) ([]byte, []byte, error) {
+	size := n * blockSize
 	block, err := alloc(size + pageSize)
 	if err != nil {
 		return nil, nil, err
